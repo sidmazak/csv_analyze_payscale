@@ -9,6 +9,19 @@
 !.yarn/plugins
 !.yarn/releases
 !.yarn/versions
+payscale_results_*.csv
+payscale_diacritic_mappings_*.json
+/snapshots
+/lib/services/snapshots
+payscale_raw_data_*.json
+payscale_test_results_*.csv
+links_.txt
+
+test_output.log
+temp2.html
+temp.html
+filebrowser_docs.json
+old.extractPayscale.js
 
 # testing
 /coverage
@@ -39,3 +52,27 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# error logs
+error.log
+logs/*.log
+
+# queue files (temporary job queue files)
+/queues/
+*.queue
+
+# database files
+*.db
+*.db-shm
+*.db-wal
+
+*.old.js
+CALCULATION_FIXES.md
+MIGRATION_SUMMARY.md
+VALIDATION_REPORT.md
+test-output.log
+
+test-matching-urls-*.json
+test-matching-urls-*.txt
+
+/sample
