@@ -98,12 +98,22 @@ interface CSVProcessorPanelProps {
   selectedFiles: Array<{ path: string; name: string }>;
 }
 
+type MatchMode = 'contains' | 'equals' | 'regex' | 'startsWith' | 'endsWith';
+type AdvancedLogic = 'AND' | 'OR';
+
+interface FieldCondition {
+  id: string;
+  field: string;
+  value: string;
+  mode: MatchMode;
+}
+
 export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
-  const [selectedFields, setSelectedFields] = useState<string[]>(['All']);
-  const [searchTerm, setSearchTerm] = useState('');
+  const [searchTerm, setSearchTerm] = useState(''); // kept for compatibility, not used in advanced mode
   const [replaceTerm, setReplaceTerm] = useState('');
   const [showOnlyMatches, setShowOnlyMatches] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isReplacing, setIsReplacing] = useState(false);
   const [stats, setStats] = useState<ProcessStats | null>(null);
   const [fileResults, setFileResults] = useState<Map<string, FileResult>>(
     new Map(),
@@ -113,41 +123,63 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
   const [useRegex, setUseRegex] = useState(false);
+  const [conditions, setConditions] = useState<FieldCondition[]>([]);
+  const [advancedLogic, setAdvancedLogic] = useState<AdvancedLogic>('AND');
+  const [replaceTargetField, setReplaceTargetField] = useState<string | undefined>();
+  const [lastAdvancedConfig, setLastAdvancedConfig] = useState<{
+    conditions: FieldCondition[];
+    logic: AdvancedLogic;
+    caseSensitive: boolean;
+  } | null>(null);
+  const [hasSearchResults, setHasSearchResults] = useState(false);
   const [currentFileName, setCurrentFileName] = useState<string>('');
   const [fieldFilter, setFieldFilter] = useState<string>('All');
   const eventSourceRef = useRef<EventSource | null>(null);
+  // Use ref to track operation type (avoids React state closure issues)
+  const operationTypeRef = useRef<'search' | 'replace' | null>(null);
 
-  const handleFieldToggle = (field: string) => {
-    if (field === 'All') {
-      setSelectedFields(['All']);
-    } else {
-      setSelectedFields((prev) => {
-        const newFields = prev.filter((f) => f !== 'All');
-        if (newFields.includes(field)) {
-          return newFields.filter((f) => f !== field);
-        } else {
-          return [...newFields, field];
-        }
-      });
-    }
+  const addCondition = () => {
+    setConditions((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        field: CSV_FIELDS[1] || 'slug_url',
+        value: '',
+        mode: 'contains',
+      },
+    ]);
   };
 
-  const startProcessing = async (mode: 'search' | 'replace') => {
-    if (!searchTerm || selectedFiles.length === 0) {
-      alert('Please select files and enter a search term');
+  const updateCondition = (id: string, patch: Partial<FieldCondition>) => {
+    setConditions((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, ...patch } : c)),
+    );
+  };
+
+  const removeCondition = (id: string) => {
+    setConditions((prev) => prev.filter((c) => c.id !== id));
+  };
+
+  const startReplace = async () => {
+    if (!replaceTargetField) {
+      alert('Please select a field to replace');
       return;
     }
 
-    // For replace mode, require a replace term
-    if (mode === 'replace' && !replaceTerm) {
-      alert('Please enter a replacement value for Replace All');
+    if (!replaceTerm) {
+      alert('Please enter a replacement value');
+      return;
+    }
+
+    if (fileResults.size === 0 || !hasSearchResults) {
+      alert('No search results found. Please run a search first.');
       return;
     }
 
     setIsProcessing(true);
+    setIsReplacing(true);
+    operationTypeRef.current = 'replace'; // Track operation type
     setStats(null);
-    setFileResults(new Map()); // clear previous results
-    setExpandedFiles(new Set());
     setCurrentFileName('');
 
     // Close existing connection
@@ -156,24 +188,39 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
     }
 
     try {
-      const response = await fetch('/api/csv/process', {
+      // Convert fileResults to API format - ONLY files with matches
+      const searchResults = Array.from(fileResults.values())
+        .filter((fileResult) => fileResult.rows.length > 0) // Only files with matches
+        .map((fileResult) => ({
+          filename: fileResult.filename,
+          path: fileResult.path,
+          rows: fileResult.rows.map((row) => ({
+            rowIndex: row.rowIndex,
+            fields: row.fields,
+          })),
+        }));
+
+      if (searchResults.length === 0) {
+        alert('No files with matches found. Please run a search first.');
+        setIsProcessing(false);
+        setIsReplacing(false);
+        operationTypeRef.current = null;
+        return;
+      }
+
+      const payload = {
+        searchResults,
+        replaceTargetField,
+        replaceValue: replaceTerm,
+        saveMode,
+      };
+
+      const response = await fetch('/api/csv/replace', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          files: selectedFiles,
-          searchTerm,
-          // Only send replaceTerm in replace mode
-          replaceTerm: mode === 'replace' && replaceTerm ? replaceTerm : undefined,
-          selectedFields: selectedFields.includes('All') ? [] : selectedFields,
-          showOnlyMatches,
-          // Only meaningful in replace mode; search mode ignores this
-          saveMode: mode === 'replace' ? saveMode : 'filebrowser',
-          caseSensitive,
-          wholeWord,
-          useRegex,
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!response.body) {
@@ -188,19 +235,183 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
-          // Process remaining buffer
+          // Process remaining buffer - must handle both event: and data: lines
+          let completeEventProcessed = false;
           if (buffer.trim()) {
             const lines = buffer.split('\n');
+            let tempEventType = currentEventType;
+            
             for (const line of lines) {
-              if (line.startsWith('data: ')) {
+              const trimmed = line.trim();
+              
+              if (trimmed === '') {
+                // Empty line - event block complete, reset
+                tempEventType = '';
+                continue;
+              }
+              
+              if (line.startsWith('event: ')) {
+                tempEventType = line.substring(7).trim();
+                if (tempEventType === 'complete') {
+                  completeEventProcessed = true;
+                }
+              } else if (line.startsWith('data: ')) {
                 try {
                   const data = JSON.parse(line.substring(6));
-                  handleEvent(currentEventType, data);
+                  handleEvent(tempEventType, data);
                 } catch (e) {
                   console.error('Failed to parse event data:', e);
                 }
               }
             }
+          }
+          // Only reset if complete event wasn't processed (it handles its own state reset)
+          if (!completeEventProcessed) {
+            setIsProcessing(false);
+            setIsReplacing(false);
+            operationTypeRef.current = null;
+          }
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          
+          if (trimmed === '') {
+            // Empty line - event block complete, reset
+            currentEventType = '';
+            continue;
+          }
+
+          if (line.startsWith('event: ')) {
+            currentEventType = line.substring(7).trim();
+          } else if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.substring(6));
+              handleEvent(currentEventType, data);
+            } catch (e) {
+              console.error('Failed to parse event data:', e, line);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Replace error:', error);
+      setIsProcessing(false);
+      setIsReplacing(false);
+      operationTypeRef.current = null;
+      alert(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  const startProcessing = async () => {
+    if (selectedFiles.length === 0) {
+      alert('Please select at least one file');
+      return;
+    }
+
+    const isAdvanced = conditions.length > 0;
+
+    if (!isAdvanced) {
+      alert('Add at least one advanced search condition');
+      return;
+    }
+
+    setIsProcessing(true);
+    setIsReplacing(false);
+    operationTypeRef.current = 'search'; // Track operation type
+    setStats(null);
+    setCurrentFileName('');
+
+    // clear previous results and remember config
+    setFileResults(new Map());
+    setExpandedFiles(new Set());
+    setHasSearchResults(false);
+    setLastAdvancedConfig({
+      conditions: [...conditions],
+      logic: advancedLogic,
+      caseSensitive,
+    });
+
+    // Close existing connection
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    try {
+      const payload: any = {
+        files: selectedFiles,
+        showOnlyMatches,
+        saveMode: 'filebrowser',
+        advanced: {
+          conditions: conditions.map(({ field, value, mode }) => ({
+            field,
+            value,
+            mode,
+          })),
+          logic: advancedLogic,
+          caseSensitive,
+        },
+      };
+
+      const response = await fetch('/api/csv/process', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.body) {
+        throw new Error('No response body');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let currentEventType = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          // Process remaining buffer - must handle both event: and data: lines
+          let completeEventProcessed = false;
+          if (buffer.trim()) {
+            const lines = buffer.split('\n');
+            let tempEventType = currentEventType;
+            
+            for (const line of lines) {
+              const trimmed = line.trim();
+              
+              if (trimmed === '') {
+                // Empty line - event block complete, reset
+                tempEventType = '';
+                continue;
+              }
+              
+              if (line.startsWith('event: ')) {
+                tempEventType = line.substring(7).trim();
+                if (tempEventType === 'complete') {
+                  completeEventProcessed = true;
+                }
+              } else if (line.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(line.substring(6));
+                  handleEvent(tempEventType, data);
+                } catch (e) {
+                  console.error('Failed to parse event data:', e);
+                }
+              }
+            }
+          }
+          // Only reset if complete event wasn't processed (it handles its own state reset)
+          if (!completeEventProcessed) {
+            setIsProcessing(false);
+            operationTypeRef.current = null;
           }
           break;
         }
@@ -233,6 +444,7 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
     } catch (error) {
       console.error('Processing error:', error);
       setIsProcessing(false);
+      operationTypeRef.current = null;
       alert(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
@@ -262,6 +474,7 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
         break;
       case 'row-processed':
         if (data.matches && data.matches.length > 0) {
+          setHasSearchResults(true);
           // Group results per file
           setFileResults((prev) => {
             const map = new Map(prev);
@@ -334,15 +547,42 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
         }
         break;
       case 'complete':
+        // Use ref to get operation type (avoids React state closure issues)
+        const operationType = operationTypeRef.current;
         setIsProcessing(false);
-        alert(
-          `Processing complete! Processed ${data.stats?.processedFiles || 0} files, found ${data.stats?.totalMatches || 0} matches.`
-        );
+        setIsReplacing(false);
+        operationTypeRef.current = null; // Reset after use
+        
+        if (operationType === 'replace') {
+          const filesProcessed = data.stats?.totalFiles || 0;
+          const filesWithReplacements = data.stats?.processedFiles || 0;
+          const totalReplacements = data.stats?.totalReplacements || 0;
+          
+          if (filesWithReplacements === 0) {
+            alert(
+              `Replace All complete! No replacements were made. Processed ${filesProcessed} file${filesProcessed !== 1 ? 's' : ''} with matches, but no values needed to be replaced.`
+            );
+          } else {
+            alert(
+              `Replace All complete! Replaced ${totalReplacements} value${totalReplacements !== 1 ? 's' : ''} in ${filesWithReplacements} file${filesWithReplacements !== 1 ? 's' : ''} out of ${filesProcessed} file${filesProcessed !== 1 ? 's' : ''} processed.`
+            );
+          }
+        } else {
+          alert(
+            `Search complete! Found ${data.stats?.totalMatches || 0} match${data.stats?.totalMatches !== 1 ? 'es' : ''} in ${data.stats?.processedFiles || 0} file${data.stats?.processedFiles !== 1 ? 's' : ''}.`
+          );
+        }
         break;
       case 'error':
         console.error('Processing error:', data.error || data.message);
+        const operationTypeOnError = operationTypeRef.current;
         setIsProcessing(false);
-        alert(`Error: ${data.error || data.message || 'Unknown error'}`);
+        setIsReplacing(false);
+        operationTypeRef.current = null;
+        const errorMsg = operationTypeOnError === 'replace'
+          ? `Replace All error: ${data.error || data.message || 'Unknown error'}`
+          : `Search error: ${data.error || data.message || 'Unknown error'}`;
+        alert(errorMsg);
         break;
       default:
         // Handle direct data objects without event type
@@ -373,126 +613,206 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
       </div>
 
       <div className="flex-1 overflow-auto p-4 space-y-6">
-        {/* Fields Section */}
-        <div>
-          <Label className="text-sm font-medium mb-2 block">Fields</Label>
-          <div className="flex flex-wrap gap-2 mb-2">
-            {CSV_FIELDS.slice(0, 4).map((field) => (
-              <Button
-                key={field}
-                variant={
-                  selectedFields.includes(field) ? 'default' : 'outline'
-                }
-                size="sm"
-                onClick={() => handleFieldToggle(field)}
-              >
-                {field}
-              </Button>
-            ))}
-            <Select
-              value={selectedFields.includes('All') ? 'All' : 'custom'}
-              onValueChange={(value) => {
-                if (value === 'All') {
-                  setSelectedFields(['All']);
-                }
-              }}
-            >
-              <SelectTrigger className="w-[120px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="All">All</SelectItem>
-                {CSV_FIELDS.slice(4).map((field) => (
-                  <SelectItem key={field} value={field}>
-                    {field}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-
-        {/* Search & Replace Section */}
+        {/* Search Section (Advanced only) */}
         <div className="space-y-4">
-          <div>
-            <Label htmlFor="search-from">From</Label>
-            <div className="flex gap-2 mt-1">
-              <div className="relative flex-1">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400" />
+          <div className="space-y-3 border rounded p-3">
+              <div className="flex items-center justify-between">
+                <Label>Advanced Search Conditions</Label>
+                <Button size="sm" variant="outline" onClick={addCondition}>
+                  + Add Condition
+                </Button>
+              </div>
+
+              {conditions.length === 0 && (
+                <p className="text-xs text-zinc-500">
+                  No conditions yet. All rows will match until you add one.
+                </p>
+              )}
+
+              {conditions.map((cond) => (
+                <div key={cond.id} className="flex gap-2 items-center">
+                  {/* Field selector */}
+                  <Select
+                    value={cond.field}
+                    onValueChange={(val) =>
+                      updateCondition(cond.id, { field: val })
+                    }
+                  >
+                    <SelectTrigger className="w-[180px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {CSV_FIELDS.slice(1).map((field) => (
+                        <SelectItem key={field} value={field}>
+                          {field}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  {/* Match mode */}
+                  <Select
+                    value={cond.mode}
+                    onValueChange={(val) =>
+                      updateCondition(cond.id, { mode: val as MatchMode })
+                    }
+                  >
+                    <SelectTrigger className="w-[140px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="contains">Contains</SelectItem>
+                      <SelectItem value="equals">Equals</SelectItem>
+                      <SelectItem value="startsWith">Starts with</SelectItem>
+                      <SelectItem value="endsWith">Ends with</SelectItem>
+                      <SelectItem value="regex">Regex</SelectItem>
+                    </SelectContent>
+                  </Select>
+
+                  {/* Value */}
+                  <Input
+                    className="flex-1"
+                    placeholder="Value..."
+                    value={cond.value}
+                    onChange={(e) =>
+                      updateCondition(cond.id, { value: e.target.value })
+                    }
+                  />
+
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => removeCondition(cond.id)}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              ))}
+
+              {/* AND / OR toggle */}
+              <div className="flex items-center gap-4 text-xs text-zinc-600 dark:text-zinc-400">
+                <span>Match rows where:</span>
+                <Button
+                  size="sm"
+                  variant={advancedLogic === 'AND' ? 'default' : 'outline'}
+                  onClick={() => setAdvancedLogic('AND')}
+                >
+                  All conditions (AND)
+                </Button>
+                <Button
+                  size="sm"
+                  variant={advancedLogic === 'OR' ? 'default' : 'outline'}
+                  onClick={() => setAdvancedLogic('OR')}
+                >
+                  Any condition (OR)
+                </Button>
+              </div>
+
+              {/* Full-width Search button */}
+              <div className="mt-3">
+                <Button
+                  variant="outline"
+                  onClick={() => startProcessing()}
+                  disabled={isProcessing || selectedFiles.length === 0}
+                  className="w-full justify-center"
+                >
+                  {isProcessing && !isReplacing ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Searching...
+                    </>
+                  ) : (
+                    <>
+                      <Search className="mr-2 h-4 w-4" />
+                      Search
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
+          </div>
+
+        {/* Replace All Section */}
+        <div className="mt-6 pt-4 border-t space-y-4">
+          <div className="space-y-3 border rounded p-3">
+            <div className="flex items-center justify-between">
+              <Label className="text-base font-semibold">Replace All</Label>
+            </div>
+
+            {/* Replace Field and Replace with grouped together */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <Label className="min-w-[120px]">Replace Field</Label>
+                <Select
+                  value={replaceTargetField}
+                  onValueChange={(val) => setReplaceTargetField(val)}
+                >
+                  <SelectTrigger className="w-[200px]">
+                    <SelectValue placeholder="Select field to replace" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {CSV_FIELDS.slice(1).map((field) => (
+                      <SelectItem key={field} value={field}>
+                        {field}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Label className="min-w-[120px]">Replace with</Label>
                 <Input
-                  id="search-from"
-                  placeholder="Search Keyword"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
+                  placeholder="Enter replacement value..."
+                  value={replaceTerm}
+                  onChange={(e) => setReplaceTerm(e.target.value)}
                   onKeyDown={(e) => {
                     if (
                       e.key === 'Enter' &&
                       !isProcessing &&
-                      searchTerm &&
-                      selectedFiles.length > 0
+                      replaceTerm &&
+                      replaceTargetField &&
+                      hasSearchResults &&
+                      fileResults.size > 0
                     ) {
-                      startProcessing('search');
+                      startReplace();
                     }
                   }}
-                  className="pl-10"
+                  className="flex-1"
                 />
               </div>
-              <Button
-                variant="outline"
-                onClick={() => startProcessing('search')}
-                disabled={isProcessing || !searchTerm || selectedFiles.length === 0}
-              >
-                {isProcessing ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Searching...
-                  </>
-                ) : (
-                  <>
-                    <Search className="mr-2 h-4 w-4" />
-                    Search
-                  </>
-                )}
-              </Button>
 
-              {/* VS Code-style search options */}
-              <div className="flex gap-1 border rounded-md p-1">
+              {/* Replace All button */}
+              <div className="mt-3">
                 <Button
-                  type="button"
-                  variant={caseSensitive ? 'default' : 'ghost'}
-                  size="sm"
-                  className="h-8 px-2 text-xs"
-                  onClick={() => setCaseSensitive((v) => !v)}
-                  title="Match Case (Aa)"
+                  onClick={() => startReplace()}
+                  disabled={
+                    isProcessing ||
+                    !replaceTerm ||
+                    !replaceTargetField ||
+                    !hasSearchResults ||
+                    fileResults.size === 0
+                  }
+                  className="w-full justify-center"
                 >
-                  Aa
-                </Button>
-                <Button
-                  type="button"
-                  variant={wholeWord ? 'default' : 'ghost'}
-                  size="sm"
-                  className="h-8 px-2 text-xs font-mono"
-                  onClick={() => setWholeWord((v) => !v)}
-                  title="Match Whole Word"
-                >
-                  W
-                </Button>
-                <Button
-                  type="button"
-                  variant={useRegex ? 'default' : 'ghost'}
-                  size="sm"
-                  className="h-8 px-2 text-xs font-mono"
-                  onClick={() => setUseRegex((v) => !v)}
-                  title="Use Regular Expression"
-                >
-                  .*
+                  {isReplacing ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Replacing...
+                    </>
+                  ) : (
+                    <>
+                      <Replace className="mr-2 h-4 w-4" />
+                      Replace All
+                    </>
+                  )}
                 </Button>
               </div>
             </div>
           </div>
 
           {/* Save mode options for Replace All */}
-          <div className="mt-2 space-y-1 text-xs text-zinc-600 dark:text-zinc-400">
+          <div className="space-y-1 text-xs text-zinc-600 dark:text-zinc-400">
             <div className="font-medium text-zinc-700 dark:text-zinc-200">
               Output destination (for Replace All)
             </div>
@@ -559,45 +879,6 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
                 />
                 Save Local
               </button>
-            </div>
-          </div>
-
-          <div>
-            <Label htmlFor="search-to">To</Label>
-            <div className="flex gap-2 mt-1">
-              <Input
-                id="search-to"
-                placeholder="Replace with..."
-                value={replaceTerm}
-                onChange={(e) => setReplaceTerm(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !isProcessing && searchTerm && replaceTerm && selectedFiles.length > 0) {
-                    startProcessing('replace');
-                  }
-                }}
-                className="flex-1"
-              />
-              <Button
-                onClick={() => startProcessing('replace')}
-                disabled={
-                  isProcessing ||
-                  !searchTerm ||
-                  !replaceTerm ||
-                  selectedFiles.length === 0
-                }
-              >
-                {isProcessing ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Processing...
-                  </>
-                ) : (
-                  <>
-                    <Replace className="mr-2 h-4 w-4" />
-                    Replace All
-                  </>
-                )}
-              </Button>
             </div>
           </div>
 
@@ -783,7 +1064,9 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
           ) : (
             <div className="border rounded p-8 text-center text-zinc-500">
               {isProcessing
-                ? 'Processing files... Results will appear as matches are found.'
+                ? isReplacing
+                  ? 'Replacing values... Results will appear as replacements are made.'
+                  : 'Searching files... Results will appear as matches are found.'
                 : 'No search results yet. Click Search to find matches.'}
             </div>
           )}
