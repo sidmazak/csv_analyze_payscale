@@ -114,6 +114,7 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
   const [showOnlyMatches, setShowOnlyMatches] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isReplacing, setIsReplacing] = useState(false);
+  const [isFixingSlugUrls, setIsFixingSlugUrls] = useState(false);
   const [stats, setStats] = useState<ProcessStats | null>(null);
   const [fileResults, setFileResults] = useState<Map<string, FileResult>>(
     new Map(),
@@ -136,7 +137,27 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
   const [fieldFilter, setFieldFilter] = useState<string>('All');
   const eventSourceRef = useRef<EventSource | null>(null);
   // Use ref to track operation type (avoids React state closure issues)
-  const operationTypeRef = useRef<'search' | 'replace' | null>(null);
+  const operationTypeRef = useRef<'search' | 'replace' | 'fix-slug-urls' | null>(null);
+
+  // Check if Fix Slug URLs section should be shown
+  const shouldShowFixSlugSection = () => {
+    if (!hasSearchResults || fileResults.size === 0) return false;
+    
+    const hasSlugUrlCondition = conditions.some(
+      (cond) =>
+        cond.field === 'slug_url' &&
+        cond.mode === 'endsWith' &&
+        cond.value === '-salary'
+    );
+    const hasLocationCondition = conditions.some(
+      (cond) =>
+        cond.field === 'location' &&
+        cond.mode === 'regex' &&
+        cond.value === '.+'
+    );
+    
+    return hasSlugUrlCondition && hasLocationCondition;
+  };
 
   const addCondition = () => {
     setConditions((prev) => [
@@ -303,6 +324,147 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
       console.error('Replace error:', error);
       setIsProcessing(false);
       setIsReplacing(false);
+      operationTypeRef.current = null;
+      alert(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  const startFixSlugUrls = async () => {
+    if (fileResults.size === 0 || !hasSearchResults) {
+      alert('No search results found. Please run a search first.');
+      return;
+    }
+
+    if (!shouldShowFixSlugSection()) {
+      alert('Fix Slug URLs is only available when searching for slug_url ending with "-salary" and location with regex ".+"');
+      return;
+    }
+
+    setIsProcessing(true);
+    setIsFixingSlugUrls(true);
+    operationTypeRef.current = 'fix-slug-urls';
+    setStats(null);
+    setCurrentFileName('');
+
+    // Close existing connection
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    try {
+      // Convert fileResults to API format - ONLY files with matches
+      const searchResults = Array.from(fileResults.values())
+        .filter((fileResult) => fileResult.rows.length > 0) // Only files with matches
+        .map((fileResult) => ({
+          filename: fileResult.filename,
+          path: fileResult.path,
+          rows: fileResult.rows.map((row) => ({
+            rowIndex: row.rowIndex,
+            fields: row.fields,
+          })),
+        }));
+
+      if (searchResults.length === 0) {
+        alert('No files with matches found. Please run a search first.');
+        setIsProcessing(false);
+        setIsFixingSlugUrls(false);
+        operationTypeRef.current = null;
+        return;
+      }
+
+      const payload = {
+        searchResults,
+        saveMode,
+      };
+
+      const response = await fetch('/api/csv/fix-slug-urls', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.body) {
+        throw new Error('No response body');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let currentEventType = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          // Process remaining buffer - must handle both event: and data: lines
+          let completeEventProcessed = false;
+          if (buffer.trim()) {
+            const lines = buffer.split('\n');
+            let tempEventType = currentEventType;
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+
+              if (trimmed === '') {
+                // Empty line - event block complete, reset
+                tempEventType = '';
+                continue;
+              }
+
+              if (line.startsWith('event: ')) {
+                tempEventType = line.substring(7).trim();
+                if (tempEventType === 'complete') {
+                  completeEventProcessed = true;
+                }
+              } else if (line.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(line.substring(6));
+                  handleEvent(tempEventType, data);
+                } catch (e) {
+                  console.error('Failed to parse event data:', e);
+                }
+              }
+            }
+          }
+          // Only reset if complete event wasn't processed (it handles its own state reset)
+          if (!completeEventProcessed) {
+            setIsProcessing(false);
+            setIsFixingSlugUrls(false);
+            operationTypeRef.current = null;
+          }
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+
+          if (trimmed === '') {
+            // Empty line - event block complete, reset
+            currentEventType = '';
+            continue;
+          }
+
+          if (line.startsWith('event: ')) {
+            currentEventType = line.substring(7).trim();
+          } else if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.substring(6));
+              handleEvent(currentEventType, data);
+            } catch (e) {
+              console.error('Failed to parse event data:', e, line);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Fix Slug URLs error:', error);
+      setIsProcessing(false);
+      setIsFixingSlugUrls(false);
       operationTypeRef.current = null;
       alert(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
@@ -551,6 +713,7 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
         const operationType = operationTypeRef.current;
         setIsProcessing(false);
         setIsReplacing(false);
+        setIsFixingSlugUrls(false);
         operationTypeRef.current = null; // Reset after use
         
         if (operationType === 'replace') {
@@ -567,6 +730,20 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
               `Replace All complete! Replaced ${totalReplacements} value${totalReplacements !== 1 ? 's' : ''} in ${filesWithReplacements} file${filesWithReplacements !== 1 ? 's' : ''} out of ${filesProcessed} file${filesProcessed !== 1 ? 's' : ''} processed.`
             );
           }
+        } else if (operationType === 'fix-slug-urls') {
+          const filesProcessed = data.stats?.totalFiles || 0;
+          const filesFixed = data.stats?.processedFiles || 0;
+          const totalFixed = data.stats?.totalReplacements || 0; // Reusing totalReplacements for count
+          
+          if (filesFixed === 0) {
+            alert(
+              `Fix Slug URLs complete! No slug URLs were fixed. Processed ${filesProcessed} file${filesProcessed !== 1 ? 's' : ''} with matches, but no slug URLs needed to be fixed.`
+            );
+          } else {
+            alert(
+              `Fix Slug URLs complete! Fixed ${totalFixed} slug URL${totalFixed !== 1 ? 's' : ''} in ${filesFixed} file${filesFixed !== 1 ? 's' : ''} out of ${filesProcessed} file${filesProcessed !== 1 ? 's' : ''} processed.`
+            );
+          }
         } else {
           alert(
             `Search complete! Found ${data.stats?.totalMatches || 0} match${data.stats?.totalMatches !== 1 ? 'es' : ''} in ${data.stats?.processedFiles || 0} file${data.stats?.processedFiles !== 1 ? 's' : ''}.`
@@ -578,10 +755,16 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
         const operationTypeOnError = operationTypeRef.current;
         setIsProcessing(false);
         setIsReplacing(false);
+        setIsFixingSlugUrls(false);
         operationTypeRef.current = null;
-        const errorMsg = operationTypeOnError === 'replace'
-          ? `Replace All error: ${data.error || data.message || 'Unknown error'}`
-          : `Search error: ${data.error || data.message || 'Unknown error'}`;
+        let errorMsg = '';
+        if (operationTypeOnError === 'replace') {
+          errorMsg = `Replace All error: ${data.error || data.message || 'Unknown error'}`;
+        } else if (operationTypeOnError === 'fix-slug-urls') {
+          errorMsg = `Fix Slug URLs error: ${data.error || data.message || 'Unknown error'}`;
+        } else {
+          errorMsg = `Search error: ${data.error || data.message || 'Unknown error'}`;
+        }
         alert(errorMsg);
         break;
       default:
@@ -716,7 +899,7 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
                   disabled={isProcessing || selectedFiles.length === 0}
                   className="w-full justify-center"
                 >
-                  {isProcessing && !isReplacing ? (
+                  {isProcessing && !isReplacing && !isFixingSlugUrls ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       Searching...
@@ -899,6 +1082,49 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
           </div>
         </div>
 
+        {/* Fix Slug URLs Section */}
+        {shouldShowFixSlugSection() && (
+          <div className="mt-6 pt-4 border-t space-y-4">
+            <div className="space-y-3 border rounded p-3">
+              <div className="flex items-center justify-between">
+                <Label className="text-base font-semibold">Fix Slug URLs</Label>
+              </div>
+
+              <div className="space-y-3">
+                <p className="text-xs text-zinc-600 dark:text-zinc-400">
+                  This will append the location value to slug_url fields ending with "-salary".
+                  <br />
+                  Example: "path-salary" + location "Munich" → "path-salary-Munich"
+                </p>
+
+                <div className="mt-3">
+                  <Button
+                    onClick={() => startFixSlugUrls()}
+                    disabled={
+                      isProcessing ||
+                      !hasSearchResults ||
+                      fileResults.size === 0
+                    }
+                    className="w-full justify-center"
+                  >
+                    {isFixingSlugUrls ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Fixing Slug URLs...
+                      </>
+                    ) : (
+                      <>
+                        <Replace className="mr-2 h-4 w-4" />
+                        Fix Slug URLs
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Statistics Section */}
         <div className="grid grid-cols-2 gap-4">
           <div className="border rounded p-4">
@@ -1066,6 +1292,8 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
               {isProcessing
                 ? isReplacing
                   ? 'Replacing values... Results will appear as replacements are made.'
+                  : isFixingSlugUrls
+                  ? 'Fixing slug URLs... Results will appear as fixes are made.'
                   : 'Searching files... Results will appear as matches are found.'
                 : 'No search results yet. Click Search to find matches.'}
             </div>
