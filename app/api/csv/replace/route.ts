@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { filebrowserClient } from '@/lib/filebrowser-client';
+import { normalizeToKebabCase } from '@/lib/utils';
 import Papa from 'papaparse';
 import fs from 'fs/promises';
 import path from 'path';
@@ -200,6 +201,9 @@ export async function POST(request: NextRequest) {
 
               // Only replace if this row was in the search results
               if (rowsToReplace.has(i)) {
+                // Track if location is being replaced
+                let locationReplacement: { oldValue: string; newValue: string } | null = null;
+                
                 // Process all replace operations for this row
                 for (const op of operations) {
                   // Check if field exists in headers (should already be validated, but double-check)
@@ -220,6 +224,51 @@ export async function POST(request: NextRequest) {
                       oldValue,
                       newValue,
                     });
+
+                    // Track location replacement for slug_url update
+                    if (op.field === 'location') {
+                      locationReplacement = { oldValue, newValue };
+                    }
+                  }
+                }
+
+                // Update slug_url if location was replaced
+                if (locationReplacement && headers.includes('slug_url')) {
+                  const currentSlugUrl = (row['slug_url'] ?? '').toString().trim();
+                  
+                  // Only process if slug_url contains -salary
+                  if (currentSlugUrl.includes('-salary')) {
+                    // Find the position of -salary
+                    const salaryIndex = currentSlugUrl.indexOf('-salary');
+                    if (salaryIndex !== -1) {
+                      // Extract base part (everything up to and including -salary)
+                      const baseSlug = currentSlugUrl.substring(0, salaryIndex + 7); // 7 = length of '-salary'
+                      
+                      // Normalize the new location
+                      const normalizedNewLocation = normalizeToKebabCase(locationReplacement.newValue);
+                      
+                      let newSlugUrl: string;
+                      if (normalizedNewLocation) {
+                        // Append new location: -salary-{location}
+                        newSlugUrl = `${baseSlug}-${normalizedNewLocation}`;
+                      } else {
+                        // New location is empty, just keep -salary (remove any existing location suffix)
+                        newSlugUrl = baseSlug;
+                      }
+                      
+                      // Only update if slug_url actually changed
+                      if (newSlugUrl !== currentSlugUrl) {
+                        row['slug_url'] = newSlugUrl;
+                        fileReplacements++;
+                        stats.totalReplacements++;
+                        
+                        rowMatchesEvents.push({
+                          field: 'slug_url',
+                          oldValue: currentSlugUrl,
+                          newValue: newSlugUrl,
+                        });
+                      }
+                    }
                   }
                 }
               }
