@@ -25,7 +25,8 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible';
-import { Search, Replace, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+import { Search, Replace, Loader2, ChevronDown, ChevronRight, MapPin, Edit } from 'lucide-react';
 
 const CSV_FIELDS = [
   'All',
@@ -108,6 +109,12 @@ interface FieldCondition {
   mode: MatchMode;
 }
 
+interface ReplaceCondition {
+  id: string;
+  field: string;
+  value: string;
+}
+
 export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
   const [searchTerm, setSearchTerm] = useState(''); // kept for compatibility, not used in advanced mode
   const [replaceTerm, setReplaceTerm] = useState('');
@@ -127,6 +134,7 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
   const [conditions, setConditions] = useState<FieldCondition[]>([]);
   const [advancedLogic, setAdvancedLogic] = useState<AdvancedLogic>('AND');
   const [replaceTargetField, setReplaceTargetField] = useState<string | undefined>();
+  const [replaceConditions, setReplaceConditions] = useState<ReplaceCondition[]>([]);
   const [lastAdvancedConfig, setLastAdvancedConfig] = useState<{
     conditions: FieldCondition[];
     logic: AdvancedLogic;
@@ -138,6 +146,14 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
   const eventSourceRef = useRef<EventSource | null>(null);
   // Use ref to track operation type (avoids React state closure issues)
   const operationTypeRef = useRef<'search' | 'replace' | 'fix-slug-urls' | null>(null);
+  
+  // State for location/state detection
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [uniqueStates, setUniqueStates] = useState<string[]>([]);
+  const [uniqueLocations, setUniqueLocations] = useState<string[]>([]);
+  const [stateLocationCombos, setStateLocationCombos] = useState<Array<{ state: string; location: string }>>([]);
+  const [activeTab, setActiveTab] = useState('find-replace');
+  const [shouldAutoTrigger, setShouldAutoTrigger] = useState(false);
 
   // Check if Fix Slug URLs section should be shown
   const shouldShowFixSlugSection = () => {
@@ -181,14 +197,35 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
     setConditions((prev) => prev.filter((c) => c.id !== id));
   };
 
-  const startReplace = async () => {
-    if (!replaceTargetField) {
-      alert('Please select a field to replace');
-      return;
-    }
+  const addReplaceCondition = () => {
+    setReplaceConditions((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        field: CSV_FIELDS[1] || 'slug_url',
+        value: '',
+      },
+    ]);
+  };
 
-    if (!replaceTerm) {
-      alert('Please enter a replacement value');
+  const updateReplaceCondition = (id: string, patch: Partial<ReplaceCondition>) => {
+    setReplaceConditions((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, ...patch } : c)),
+    );
+  };
+
+  const removeReplaceCondition = (id: string) => {
+    setReplaceConditions((prev) => prev.filter((c) => c.id !== id));
+  };
+
+  const startReplace = async () => {
+    // Filter out invalid conditions
+    const activeReplaceConditions = replaceConditions.filter(
+      (cond) => cond.field && cond.value !== undefined && cond.value !== null
+    );
+
+    if (activeReplaceConditions.length === 0) {
+      alert('Please add at least one replace condition with a field and value');
       return;
     }
 
@@ -229,10 +266,20 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
         return;
       }
 
+      // Build replace operations array
+      const replaceOperations: Array<{ field: string; value: string }> = [];
+      
+      for (const cond of activeReplaceConditions) {
+        const actualValue = cond.value.trim().toLowerCase() === 'empty' ? '' : cond.value;
+        replaceOperations.push({
+          field: cond.field,
+          value: actualValue,
+        });
+      }
+
       const payload = {
         searchResults,
-        replaceTargetField,
-        replaceValue: replaceTerm,
+        replaceOperations,
         saveMode,
       };
 
@@ -774,6 +821,164 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
     }
   };
 
+  // Function to start location/state detection
+  const startDetection = async () => {
+    if (selectedFiles.length === 0) {
+      alert('Please select at least one CSV file');
+      return;
+    }
+
+    setIsDetecting(true);
+    setUniqueStates([]);
+    setUniqueLocations([]);
+    setStateLocationCombos([]);
+
+    try {
+      const response = await fetch('/api/csv/detect-location-state', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ files: selectedFiles }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Detection failed' }));
+        throw new Error(errorData.error || 'Detection failed');
+      }
+
+      const data = await response.json();
+      setUniqueStates(data.uniqueStates || []);
+      setUniqueLocations(data.uniqueLocations || []);
+      setStateLocationCombos(data.stateLocationCombos || []);
+    } catch (error) {
+      console.error('Detection error:', error);
+      alert(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setIsDetecting(false);
+    }
+  };
+
+  // Function to handle edit from unique states table
+  const handleEditFromState = (stateValue: string) => {
+    // Switch to Find & Replace tab
+    setActiveTab('find-replace');
+    
+    // Check if state is empty or whitespace only
+    const isStateEmpty = !stateValue || stateValue.trim() === '';
+    
+    // Clear existing conditions and set new ones
+    setConditions([
+      {
+        id: crypto.randomUUID(),
+        field: 'state',
+        value: isStateEmpty ? '^\\s*$' : stateValue,
+        mode: isStateEmpty ? 'regex' : 'equals',
+      },
+    ]);
+    
+    // Set logic to AND
+    setAdvancedLogic('AND');
+    
+    // Clear previous results
+    setFileResults(new Map());
+    setExpandedFiles(new Set());
+    setHasSearchResults(false);
+    setStats(null);
+    
+    // Reset Replace All section completely
+    setReplaceConditions([]);
+    setReplaceTargetField(undefined);
+    setReplaceTerm('');
+    
+    // Set flag to auto-trigger search after state updates
+    setShouldAutoTrigger(true);
+  };
+
+  // Function to handle edit from state & location combinations table
+  const handleEditFromCombo = (stateValue: string, locationValue: string) => {
+    // Switch to Find & Replace tab
+    setActiveTab('find-replace');
+    
+    // Clear existing conditions and set new ones
+    const newConditions: FieldCondition[] = [];
+    
+    // Handle state - check if empty or whitespace only
+    const isStateEmpty = !stateValue || stateValue.trim() === '';
+    // Always add state condition (even if empty, use regex to match empty)
+    newConditions.push({
+      id: crypto.randomUUID(),
+      field: 'state',
+      value: isStateEmpty ? '^\\s*$' : stateValue,
+      mode: isStateEmpty ? 'regex' : 'equals',
+    });
+    
+    // Handle location - check if empty or whitespace only
+    const isLocationEmpty = !locationValue || locationValue.trim() === '';
+    // Always add location condition (even if empty, use regex to match empty)
+    newConditions.push({
+      id: crypto.randomUUID(),
+      field: 'location',
+      value: isLocationEmpty ? '^\\s*$' : locationValue,
+      mode: isLocationEmpty ? 'regex' : 'equals',
+    });
+    
+    setConditions(newConditions);
+    
+    // Set logic to AND
+    setAdvancedLogic('AND');
+    
+    // Clear previous results
+    setFileResults(new Map());
+    setExpandedFiles(new Set());
+    setHasSearchResults(false);
+    setStats(null);
+    
+    // Reset Replace All section completely
+    setReplaceConditions([]);
+    setReplaceTargetField(undefined);
+    setReplaceTerm('');
+    
+    // Set flag to auto-trigger search after state updates
+    setShouldAutoTrigger(true);
+  };
+
+  // Function to handle edit from unique locations table
+  const handleEditFromLocation = (locationValue: string) => {
+    // Switch to Find & Replace tab
+    setActiveTab('find-replace');
+    
+    // Check if location is empty or whitespace only
+    const isLocationEmpty = !locationValue || locationValue.trim() === '';
+    
+    // Clear existing conditions and set new ones
+    setConditions([
+      {
+        id: crypto.randomUUID(),
+        field: 'location',
+        value: isLocationEmpty ? '^\\s*$' : locationValue,
+        mode: isLocationEmpty ? 'regex' : 'equals',
+      },
+    ]);
+    
+    // Set logic to AND
+    setAdvancedLogic('AND');
+    
+    // Clear previous results
+    setFileResults(new Map());
+    setExpandedFiles(new Set());
+    setHasSearchResults(false);
+    setStats(null);
+    
+    // Reset Replace All section completely
+    setReplaceConditions([]);
+    setReplaceTargetField(undefined);
+    setReplaceTerm('');
+    
+    // Set flag to auto-trigger search after state updates
+    setShouldAutoTrigger(true);
+  };
+
   useEffect(() => {
     return () => {
       if (eventSourceRef.current) {
@@ -781,6 +986,17 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
       }
     };
   }, []);
+
+  // Auto-trigger search when conditions are set from edit buttons
+  useEffect(() => {
+    if (shouldAutoTrigger && conditions.length > 0 && selectedFiles.length > 0 && !isProcessing) {
+      // Reset the flag first to prevent re-triggering
+      setShouldAutoTrigger(false);
+      
+      // Trigger search with current conditions (state is now updated)
+      startProcessing();
+    }
+  }, [shouldAutoTrigger, conditions, selectedFiles.length, isProcessing]);
 
   return (
     <div className="flex h-full flex-col bg-white dark:bg-zinc-900">
@@ -795,7 +1011,15 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto p-4 space-y-6">
+      <div className="flex-1 overflow-auto p-4">
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+          <TabsList className="mb-4">
+            <TabsTrigger value="find-replace">Find & Replace</TabsTrigger>
+            <TabsTrigger value="detect-location-state">Detect Location & State</TabsTrigger>
+          </TabsList>
+
+          {/* Find & Replace Tab */}
+          <TabsContent value="find-replace" className="space-y-6">
         {/* Search Section (Advanced only) */}
         <div className="space-y-4">
           <div className="space-y-3 border rounded p-3">
@@ -920,18 +1144,29 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
           <div className="space-y-3 border rounded p-3">
             <div className="flex items-center justify-between">
               <Label className="text-base font-semibold">Replace All</Label>
+              <Button size="sm" variant="outline" onClick={addReplaceCondition}>
+                + Add Replace Condition
+              </Button>
             </div>
 
-            {/* Replace Field and Replace with grouped together */}
-            <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <Label className="min-w-[120px]">Replace Field</Label>
+            {/* Multiple Replace Conditions */}
+            {replaceConditions.length === 0 && (
+              <p className="text-xs text-zinc-500">
+                No replace conditions yet. Add one to replace multiple fields.
+              </p>
+            )}
+
+            {replaceConditions.map((cond) => (
+              <div key={cond.id} className="flex gap-2 items-center">
+                {/* Field selector */}
                 <Select
-                  value={replaceTargetField}
-                  onValueChange={(val) => setReplaceTargetField(val)}
+                  value={cond.field}
+                  onValueChange={(val) =>
+                    updateReplaceCondition(cond.id, { field: val })
+                  }
                 >
                   <SelectTrigger className="w-[200px]">
-                    <SelectValue placeholder="Select field to replace" />
+                    <SelectValue placeholder="Select field" />
                   </SelectTrigger>
                   <SelectContent>
                     {CSV_FIELDS.slice(1).map((field) => (
@@ -941,56 +1176,51 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
 
-              <div className="flex items-center gap-2">
-                <Label className="min-w-[120px]">Replace with</Label>
+                {/* Replace value */}
                 <Input
-                  placeholder="Enter replacement value..."
-                  value={replaceTerm}
-                  onChange={(e) => setReplaceTerm(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (
-                      e.key === 'Enter' &&
-                      !isProcessing &&
-                      replaceTerm &&
-                      replaceTargetField &&
-                      hasSearchResults &&
-                      fileResults.size > 0
-                    ) {
-                      startReplace();
-                    }
-                  }}
                   className="flex-1"
-                />
-              </div>
-
-              {/* Replace All button */}
-              <div className="mt-3">
-                <Button
-                  onClick={() => startReplace()}
-                  disabled={
-                    isProcessing ||
-                    !replaceTerm ||
-                    !replaceTargetField ||
-                    !hasSearchResults ||
-                    fileResults.size === 0
+                  placeholder="Enter replacement value (or 'empty' to clear)..."
+                  value={cond.value}
+                  onChange={(e) =>
+                    updateReplaceCondition(cond.id, { value: e.target.value })
                   }
-                  className="w-full justify-center"
+                />
+
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={() => removeReplaceCondition(cond.id)}
                 >
-                  {isReplacing ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Replacing...
-                    </>
-                  ) : (
-                    <>
-                      <Replace className="mr-2 h-4 w-4" />
-                      Replace All
-                    </>
-                  )}
+                  ✕
                 </Button>
               </div>
+            ))}
+
+            {/* Replace All button */}
+            <div className="mt-3">
+              <Button
+                onClick={() => startReplace()}
+                disabled={
+                  isProcessing ||
+                  replaceConditions.length === 0 ||
+                  !hasSearchResults ||
+                  fileResults.size === 0
+                }
+                className="w-full justify-center"
+              >
+                {isReplacing ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Replacing...
+                  </>
+                ) : (
+                  <>
+                    <Replace className="mr-2 h-4 w-4" />
+                    Replace All
+                  </>
+                )}
+              </Button>
             </div>
           </div>
 
@@ -1299,6 +1529,168 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
             </div>
           )}
         </div>
+          </TabsContent>
+
+          {/* Detect Location & State Tab */}
+          <TabsContent value="detect-location-state" className="space-y-6">
+            <div className="space-y-4">
+              <div className="space-y-3 border rounded p-3">
+                <div className="flex items-center justify-between">
+                  <Label className="text-base font-semibold">Detect Location & State</Label>
+                </div>
+                
+                <p className="text-xs text-zinc-600 dark:text-zinc-400">
+                  This will scan all selected CSV files and extract unique states and unique combinations of state and location.
+                </p>
+
+                <div className="mt-3">
+                  <Button
+                    onClick={startDetection}
+                    disabled={isDetecting || selectedFiles.length === 0}
+                    className="w-full justify-center"
+                  >
+                    {isDetecting ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Detecting...
+                      </>
+                    ) : (
+                      <>
+                        <MapPin className="mr-2 h-4 w-4" />
+                        Start Detection
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+
+              {/* State & Location Combinations Table - TOP */}
+              <div className="border rounded p-4">
+                <Label className="text-base font-semibold mb-3 block">Unique State & Location Combinations</Label>
+                {stateLocationCombos.length > 0 ? (
+                  <div className="overflow-auto max-h-[300px]">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="w-12">#</TableHead>
+                          <TableHead>State</TableHead>
+                          <TableHead>Location</TableHead>
+                          <TableHead className="w-20">Action</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {stateLocationCombos.map((combo, index) => (
+                          <TableRow key={`${combo.state}-${combo.location}-${index}`}>
+                            <TableCell className="font-mono text-xs">{index + 1}</TableCell>
+                            <TableCell>{combo.state || '(empty)'}</TableCell>
+                            <TableCell>{combo.location || '(empty)'}</TableCell>
+                            <TableCell>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => handleEditFromCombo(combo.state, combo.location)}
+                                className="h-8 w-8 p-0"
+                                title="Edit rows with this state and location"
+                              >
+                                <Edit className="h-4 w-4" />
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                ) : (
+                  <div className="text-center text-zinc-500 py-8">
+                    {isDetecting ? 'Detecting combinations...' : 'No combinations detected yet. Click "Start Detection" to begin.'}
+                  </div>
+                )}
+              </div>
+
+              {/* Unique Locations Table - MIDDLE */}
+              <div className="border rounded p-4">
+                <Label className="text-base font-semibold mb-3 block">Unique Locations</Label>
+                {uniqueLocations.length > 0 ? (
+                  <div className="overflow-auto max-h-[300px]">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="w-12">#</TableHead>
+                          <TableHead>Location</TableHead>
+                          <TableHead className="w-20">Action</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {uniqueLocations.map((location, index) => (
+                          <TableRow key={location}>
+                            <TableCell className="font-mono text-xs">{index + 1}</TableCell>
+                            <TableCell>{location || '(empty)'}</TableCell>
+                            <TableCell>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => handleEditFromLocation(location)}
+                                className="h-8 w-8 p-0"
+                                title="Edit rows with this location"
+                              >
+                                <Edit className="h-4 w-4" />
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                ) : (
+                  <div className="text-center text-zinc-500 py-8">
+                    {isDetecting ? 'Detecting locations...' : 'No locations detected yet. Click "Start Detection" to begin.'}
+                  </div>
+                )}
+              </div>
+
+              {/* Unique States Table - BOTTOM */}
+              <div className="border rounded p-4">
+                <Label className="text-base font-semibold mb-3 block">Unique States</Label>
+                {uniqueStates.length > 0 ? (
+                  <div className="overflow-auto max-h-[300px]">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="w-12">#</TableHead>
+                          <TableHead>State</TableHead>
+                          <TableHead className="w-20">Action</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {uniqueStates.map((state, index) => (
+                          <TableRow key={state}>
+                            <TableCell className="font-mono text-xs">{index + 1}</TableCell>
+                            <TableCell>{state || '(empty)'}</TableCell>
+                            <TableCell>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => handleEditFromState(state)}
+                                className="h-8 w-8 p-0"
+                                title="Edit rows with this state"
+                              >
+                                <Edit className="h-4 w-4" />
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                ) : (
+                  <div className="text-center text-zinc-500 py-8">
+                    {isDetecting ? 'Detecting states...' : 'No states detected yet. Click "Start Detection" to begin.'}
+                  </div>
+                )}
+              </div>
+            </div>
+          </TabsContent>
+        </Tabs>
       </div>
     </div>
   );

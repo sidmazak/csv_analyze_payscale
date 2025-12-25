@@ -17,8 +17,9 @@ interface SearchResult {
 
 interface ReplaceRequest {
   searchResults: SearchResult[];
-  replaceTargetField: string;
-  replaceValue: string;
+  replaceTargetField?: string; // Keep for backwards compatibility
+  replaceValue?: string; // Keep for backwards compatibility
+  replaceOperations?: Array<{ field: string; value: string }>; // New: multiple replacements
   saveMode: 'filebrowser' | 'overwrite' | 'local';
 }
 
@@ -47,6 +48,7 @@ export async function POST(request: NextRequest) {
           searchResults,
           replaceTargetField,
           replaceValue,
+          replaceOperations,
           saveMode = 'filebrowser',
         } = body;
 
@@ -56,12 +58,46 @@ export async function POST(request: NextRequest) {
           return;
         }
 
-        if (!replaceTargetField || !replaceValue) {
+        // Build replace operations array (support both old and new format)
+        let operations: Array<{ field: string; value: string }> = [];
+        
+        if (replaceOperations && replaceOperations.length > 0) {
+          // New format: multiple operations
+          operations = replaceOperations;
+        } else if (replaceTargetField) {
+          // Old format: single field/value (backwards compatible)
+          if (replaceValue === undefined || replaceValue === null) {
+            sendEvent('error', {
+              message: 'Replace value must be provided (empty string is allowed)',
+            });
+            controller.close();
+            return;
+          }
+          operations = [{ field: replaceTargetField, value: replaceValue }];
+        } else {
           sendEvent('error', {
-            message: 'Replace target field and value are required',
+            message: 'Either replaceOperations or replaceTargetField must be provided',
           });
           controller.close();
           return;
+        }
+
+        // Validate all operations
+        for (const op of operations) {
+          if (!op.field) {
+            sendEvent('error', {
+              message: 'All replace operations must have a field specified',
+            });
+            controller.close();
+            return;
+          }
+          if (op.value === undefined || op.value === null) {
+            sendEvent('error', {
+              message: 'All replace operations must have a value specified (empty string is allowed)',
+            });
+            controller.close();
+            return;
+          }
         }
 
         // Group rows by file for efficient processing
@@ -126,11 +162,15 @@ export async function POST(request: NextRequest) {
             const headers = Object.keys(rows[0] || {});
             stats.totalRows += rows.length;
 
-            // Check if replaceTargetField exists in headers
-            if (!headers.includes(replaceTargetField)) {
+            // Check if all replace operation fields exist in headers
+            const invalidFields = operations
+              .map((op) => op.field)
+              .filter((field) => !headers.includes(field));
+            
+            if (invalidFields.length > 0) {
               sendEvent('error', {
                 filename: searchResult.filename,
-                error: `Field "${replaceTargetField}" not found in CSV headers`,
+                error: `Fields not found in CSV headers: ${invalidFields.join(', ')}`,
               });
               continue;
             }
@@ -138,7 +178,7 @@ export async function POST(request: NextRequest) {
             sendEvent('file-info', {
               filename: searchResult.filename,
               totalRows: rows.length,
-              fieldsToReplace: 1,
+              fieldsToReplace: operations.length,
             });
 
             // Create a map of row indices that need replacement
@@ -160,19 +200,27 @@ export async function POST(request: NextRequest) {
 
               // Only replace if this row was in the search results
               if (rowsToReplace.has(i)) {
-                const oldValue = row[replaceTargetField] ?? '';
-                const newValue = replaceValue;
+                // Process all replace operations for this row
+                for (const op of operations) {
+                  // Check if field exists in headers (should already be validated, but double-check)
+                  if (!headers.includes(op.field)) {
+                    continue; // Skip if field doesn't exist
+                  }
 
-                if (oldValue !== newValue) {
-                  row[replaceTargetField] = newValue;
-                  fileReplacements++;
-                  stats.totalReplacements++;
+                  const oldValue = row[op.field] ?? '';
+                  const newValue = op.value;
 
-                  rowMatchesEvents.push({
-                    field: replaceTargetField,
-                    oldValue,
-                    newValue,
-                  });
+                  if (oldValue !== newValue) {
+                    row[op.field] = newValue;
+                    fileReplacements++;
+                    stats.totalReplacements++;
+
+                    rowMatchesEvents.push({
+                      field: op.field,
+                      oldValue,
+                      newValue,
+                    });
+                  }
                 }
               }
 
