@@ -207,6 +207,7 @@ export function FileBrowserPanel({ onFilesSelected }: FileBrowserPanelProps) {
           )}
         </div>
       </div>
+      
 
       <Tabs defaultValue="filebrowser" className="flex-1 flex flex-col min-h-0 overflow-hidden">
         <TabsList className="mx-4 mt-2 shrink-0">
