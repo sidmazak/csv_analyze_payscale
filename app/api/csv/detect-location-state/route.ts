@@ -61,8 +61,7 @@ export async function POST(request: NextRequest) {
           const state = hasState ? (row.state || '').trim() : '';
           const location = hasLocation ? (row.location || '').trim() : '';
 
-          // Only add combinations where location is present (not empty)
-          // But allow state to be empty if location is present
+          // Process rows with location (for combinations)
           if (location) {
             const comboKey = `${state}|||${location}`;
             if (!stateLocationSet.has(comboKey)) {
@@ -72,11 +71,16 @@ export async function POST(request: NextRequest) {
               // Add location to unique locations set
               uniqueLocationsSet.add(location);
               
-              // Only add state to unique states if it's present in a combination with location
+              // Add state to unique states if it's present in a combination with location
               if (state) {
                 uniqueStatesSet.add(state);
               }
             }
+          }
+          
+          // Also process rows with state but no location (standalone states)
+          if (state && !location) {
+            uniqueStatesSet.add(state);
           }
         }
       } catch (error) {
