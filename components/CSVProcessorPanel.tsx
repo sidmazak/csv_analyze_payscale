@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -998,6 +998,36 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
     }
   }, [shouldAutoTrigger, conditions, selectedFiles.length, isProcessing]);
 
+  // Extract all unique values from search results
+  const uniqueValues = useMemo(() => {
+    const valuesSet = new Set<string>();
+    
+    if (fileResults.size === 0) {
+      return [];
+    }
+    
+    // Iterate through all files and rows
+    Array.from(fileResults.values()).forEach((fileResult) => {
+      fileResult.rows.forEach((row) => {
+        // Extract all field values
+        Object.values(row.fields).forEach((value) => {
+          // Handle values that might contain " → " (from replacements)
+          const cleanValue = value.includes(' → ') 
+            ? value.split(' → ')[0].trim() 
+            : value.trim();
+          
+          // Only add non-empty values
+          if (cleanValue && cleanValue !== '-') {
+            valuesSet.add(cleanValue);
+          }
+        });
+      });
+    });
+    
+    // Convert to sorted array
+    return Array.from(valuesSet).sort();
+  }, [fileResults]);
+
   return (
     <div className="flex h-full flex-col bg-white dark:bg-zinc-900">
       <div className="border-b p-4">
@@ -1311,6 +1341,39 @@ export function CSVProcessorPanel({ selectedFiles }: CSVProcessorPanelProps) {
             </Label>
           </div>
         </div>
+
+        {/* Unique Values Section */}
+        {hasSearchResults && fileResults.size > 0 && (
+          <div className="mt-6 pt-4 border-t space-y-4">
+            <div className="space-y-3 border rounded p-3">
+              <div className="flex items-center justify-between">
+                <Label className="text-base font-semibold">Unique Values from Search</Label>
+                <span className="text-sm text-zinc-500">
+                  {uniqueValues.length} unique value{uniqueValues.length !== 1 ? 's' : ''}
+                </span>
+              </div>
+
+              {uniqueValues.length > 0 ? (
+                <div className="border rounded p-3 bg-zinc-50 dark:bg-zinc-800 max-h-[300px] overflow-auto">
+                  <div className="flex flex-wrap gap-2">
+                    {uniqueValues.map((value, index) => (
+                      <span
+                        key={index}
+                        className="inline-block px-2 py-1 text-xs bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-600 rounded"
+                      >
+                        {value}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p className="text-xs text-zinc-500">
+                  No unique values found in search results.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Fix Slug URLs Section */}
         {shouldShowFixSlugSection() && (
